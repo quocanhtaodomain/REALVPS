@@ -12,6 +12,8 @@ WIN_CONF="$BASE_DIR/windows_urls.conf"
 DEPS_MARK="$BASE_DIR/.deps_ok"
 NOVNC_DIR=""
 QEMU=""
+USERLIBS="$BASE_DIR/.libs"
+for d in "$USERLIBS"/usr/lib/* "$USERLIBS"/lib/* "$USERLIBS"/usr/lib "$USERLIBS"/lib; do [ -d "$d" ] && export LD_LIBRARY_PATH="$d${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; done
 
 # stdin phải là terminal (phòng khi chạy kiểu curl | bash)
 [ -t 0 ] || { [ -e /dev/tty ] && exec </dev/tty; }
@@ -20,6 +22,7 @@ QEMU=""
 R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[34m'; M=$'\e[35m'; C=$'\e[36m'; N=$'\e[0m'
 info(){ echo -e "${C}[INFO]${N} $*"; }
 ok(){   echo -e "${G}[SUCCESS]${N} $*"; }
+okl(){  echo -e "[  ${G}OK${N}  ] $*"; }
 warn(){ echo -e "${Y}[WARN]${N} $*"; }
 err(){  echo -e "${R}[ERROR]${N} $*"; }
 ask(){  # ask VAR "nhãn" "mặc định"
@@ -121,6 +124,25 @@ EOF
   [ -z "$QEMU" ] && { err "Không tìm thấy qemu-system-x86_64. Cài thủ công rồi chạy lại."; exit 1; }
   check_qemu
 }
+userland_libaio(){   # cài libaio KHÔNG cần root: tải .deb rồi giải nén vào $USERLIBS
+  mkdir -p "$USERLIBS" && local t; t=$(mktemp -d); cd "$t" || return 1
+  for pkg in libaio1t64 libaio1; do
+    command -v apt-get >/dev/null && apt-get download "$pkg" >/dev/null 2>&1 && break
+    local u="http://deb.debian.org/debian/pool/main/liba/libaio/"
+    local f; f=$(curl -fsSL "$u" 2>/dev/null | grep -o "${pkg}_[^\"]*_amd64\.deb" | sort -uV | tail -1)
+    [ -n "$f" ] && curl -fsSL -o "$f" "$u$f" && break
+  done
+  local deb; deb=$(ls ./*.deb 2>/dev/null | head -1)
+  [ -z "$deb" ] && { cd - >/dev/null; rm -rf "$t"; return 1; }
+  if command -v dpkg-deb >/dev/null; then dpkg-deb -x "$deb" "$USERLIBS"
+  else ar x "$deb" && tar -xf data.tar.* -C "$USERLIBS"; fi
+  cd - >/dev/null; rm -rf "$t"
+  for d in "$USERLIBS"/usr/lib/* "$USERLIBS"/lib/* "$USERLIBS"/usr/lib "$USERLIBS"/lib; do
+    [ -d "$d" ] && export LD_LIBRARY_PATH="$d${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  done
+  # Debian đặt tên libaio.so.1t64 → tạo symlink libaio.so.1
+  for f in $(find "$USERLIBS" -name 'libaio.so.1t64' 2>/dev/null); do ln -sf "$f" "$(dirname "$f")/libaio.so.1"; done
+}
 check_qemu(){
   local out; out=$("$QEMU" --version 2>&1) && return 0
   err "QEMU ($QEMU) không chạy được: $(echo "$out" | head -1)"
@@ -128,8 +150,10 @@ check_qemu(){
     warn "Thiếu thư viện → thử cài libaio..."
     detect_pm; for p in libaio1 libaio1t64 libaio; do pkg_install "$p" >/dev/null 2>&1; done
     "$QEMU" --version >/dev/null 2>&1 && { ok "Đã sửa lỗi thư viện."; return 0; }
-    err "Vẫn lỗi. Chạy: ldd $QEMU | grep 'not found'  rồi cài các thư viện còn thiếu (cần root/sudo)."
-    [ -z "$SUDO" ] && [ "$(id -u)" -ne 0 ] && warn "Bạn không phải root và không có sudo nên không tự cài được."
+    warn "Không có quyền cài hệ thống → cài libaio vào thư mục user ($USERLIBS)..."
+    userland_libaio
+    "$QEMU" --version >/dev/null 2>&1 && { ok "Đã sửa lỗi thư viện (user-space)."; return 0; }
+    err "Vẫn lỗi. Chạy: ldd $QEMU | grep 'not found'  để xem thư viện còn thiếu."
     exit 1
   fi
 }
@@ -215,12 +239,24 @@ chpasswd:
     root:$VM_PASS
 EOF
     [ "$VM_USER" != root ] && echo "    $VM_USER:$VM_PASS"
+    if [ "$VM_GUI" != y ]; then
+      cat <<EOF
+write_files:
+  - path: /etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf
+    content: |
+      [Service]
+      ExecStart=
+      ExecStart=-/sbin/agetty --autologin $VM_USER --noclear %I \$TERM
+EOF
+    fi
     cat <<'EOF'
 runcmd:
  - rm -f /etc/ssh/sshd_config.d/60-cloudimg-settings.conf
  - sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
  - sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
  - systemctl restart sshd || systemctl restart ssh
+ - systemctl daemon-reload
+ - systemctl restart serial-getty@ttyS0.service
 EOF
     [ "$VM_GUI" = y ] && gui_cmds
   } > "$d/user-data"
@@ -335,7 +371,15 @@ start_vm(){
   fi
 
   if [ "$VM_GUI" != y ]; then
-    info "🖥️  Chạy trực tiếp trên terminal này. Thoát VM: Ctrl+A rồi X  |  SSH: ssh -p $VM_PORT $VM_USER@localhost"
+    echo
+    okl "Accelerator: $(kvm_ok && echo KVM || echo 'TCG (tối ưu)')"
+    okl "CPU: $cpus vCPU | RAM: ${VM_MEM}MB | Disk cache: $cache"
+    okl "Disk: $img"
+    okl "Network: SSH → localhost:$VM_PORT"
+    okl "Starting $n ... (log boot của VM hiện ngay bên dưới, tự đăng nhập khi boot xong)"
+    kvm_ok || warn "Không có KVM nên boot lần đầu có thể mất vài phút (cloud-init đang cấu hình), cứ để yên."
+    echo -e "${Y}  Thoát VM: Ctrl+A rồi X${N}"
+    echo
     trap 'rm -f "$(pidf "$n" qemu)"' RETURN
     "$QEMU" "${A[@]}" -nographic
     return
@@ -403,6 +447,13 @@ edit_vm(){
   ask VM_MEM "Memory MB" "$VM_MEM"; ask VM_CPUS "CPUs" "$VM_CPUS"; ask VM_PORT "Port" "$VM_PORT"
   ask VM_FWD "Port forwards" "$VM_FWD"
   ask VM_GUI "GUI (y/n)" "$VM_GUI"
+  if [ "$VM_FAM" != win ]; then
+    ask D "Áp dụng lại cloud-init (đổi user/pass, bật autologin console)? (y/n)" n
+    if [ "$D" = y ]; then
+      ask VM_USER "Username" "$VM_USER"; ask VM_PASS "Password" "$VM_PASS"
+      make_linux_seed && ok "Đã tạo seed mới, lần boot tới VM sẽ tự áp dụng."
+    fi
+  fi
   if [ -n "$VM_ISO" ]; then ask D "Gỡ ISO cài đặt? (y/n)" n; [ "$D" = y ] && VM_ISO=""; fi
   VM_NAME=$old; save_conf; ok "Đã lưu. (User/password chỉ áp dụng lúc tạo VM.)"
 }
