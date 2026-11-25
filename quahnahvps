@@ -1,0 +1,463 @@
+#!/usr/bin/env bash
+# ============================================================================
+#  Quahnah VPS Create - tạo & quản lý VM bằng QEMU (có KVM thì dùng, không có thì TCG tối ưu)
+#  Chạy:  bash <(curl -fsSL https://RAW_URL/quahnah-vps.sh)
+# ============================================================================
+
+SCRIPT_URL=""   # <-- điền raw URL của file này để lần đầu tự cài lệnh `quahnah` (có thể để trống)
+BASE_DIR="${QVPS_HOME:-$HOME/vms}"
+CACHE_DIR="$BASE_DIR/.cache"
+RUN_DIR="$BASE_DIR/.run"
+WIN_CONF="$BASE_DIR/windows_urls.conf"
+DEPS_MARK="$BASE_DIR/.deps_ok"
+NOVNC_DIR=""
+QEMU=""
+
+# stdin phải là terminal (phòng khi chạy kiểu curl | bash)
+[ -t 0 ] || { [ -e /dev/tty ] && exec </dev/tty; }
+
+# ---------- màu & log ----------
+R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[34m'; M=$'\e[35m'; C=$'\e[36m'; N=$'\e[0m'
+info(){ echo -e "${C}[INFO]${N} $*"; }
+ok(){   echo -e "${G}[SUCCESS]${N} $*"; }
+warn(){ echo -e "${Y}[WARN]${N} $*"; }
+err(){  echo -e "${R}[ERROR]${N} $*"; }
+ask(){  # ask VAR "nhãn" "mặc định"
+  local __v=$1 __l=$2 __d=$3 __i
+  read -r -p "${M}[INPUT]${N} ${__l}${__d:+ (default: $__d)}: " __i
+  printf -v "$__v" '%s' "${__i:-$__d}"
+}
+pause(){ read -r -p "${M}[INPUT]${N} Nhấn Enter để tiếp tục..." _; }
+
+banner(){
+  clear 2>/dev/null
+  echo -e "${C}"
+  cat <<'EOF'
+ ██████╗ ██╗   ██╗ █████╗ ██╗  ██╗███╗   ██╗ █████╗ ██╗  ██╗
+██╔═══██╗██║   ██║██╔══██╗██║  ██║████╗  ██║██╔══██╗██║  ██║
+██║   ██║██║   ██║███████║███████║██╔██╗ ██║███████║███████║
+██║▄▄ ██║██║   ██║██╔══██║██╔══██║██║╚██╗██║██╔══██║██╔══██║
+╚██████╔╝╚██████╔╝██║  ██║██║  ██║██║ ╚████║██║  ██║██║  ██║
+ ╚══▀▀═╝  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝╚═╝  ╚═╝
+EOF
+  echo -e "${N}"
+  echo "                    V P S   C R E A T E"
+  echo
+  if kvm_ok; then echo -e "   Accel: ${G}KVM (full tốc độ)${N}"; else echo -e "   Accel: ${Y}TCG (không có KVM - đã bật chế độ tối ưu)${N}"; fi
+  echo
+}
+
+# ---------- hệ thống ----------
+SUDO=""; [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null && SUDO="sudo"
+kvm_ok(){ [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ] && grep -Eq 'vmx|svm' /proc/cpuinfo 2>/dev/null; }
+
+detect_pm(){ PM=""; for p in apt-get dnf yum apk pacman; do command -v "$p" >/dev/null 2>&1 && { PM=$p; return; }; done; }
+pkg_install(){
+  case $PM in
+    apt-get) $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
+    dnf|yum) $SUDO "$PM" install -y "$@" ;;
+    apk)     $SUDO apk add --no-cache "$@" ;;
+    pacman)  $SUDO pacman -S --noconfirm --needed "$@" ;;
+  esac
+}
+find_qemu(){
+  QEMU=$(command -v qemu-system-x86_64 2>/dev/null)
+  [ -z "$QEMU" ] && [ -x /usr/libexec/qemu-kvm ] && QEMU=/usr/libexec/qemu-kvm
+}
+find_novnc(){
+  for d in /usr/share/novnc /opt/novnc /usr/share/webapps/novnc; do
+    [ -f "$d/vnc.html" ] && { NOVNC_DIR=$d; return; }
+  done
+}
+
+install_deps(){
+  detect_pm
+  [ -z "$PM" ] && { err "Không nhận diện được package manager."; return 1; }
+  info "📦 Cài các gói cần thiết bằng $PM (chỉ chạy lần đầu)..."
+  local pk=()
+  case $PM in
+    apt-get) $SUDO apt-get update -y >/dev/null 2>&1
+      pk=(qemu-system-x86 qemu-utils genisoimage socat curl wget openssl python3 python3-pip websockify novnc ovmf procps iproute2 ca-certificates git) ;;
+    dnf|yum) pk=(qemu-kvm qemu-img genisoimage xorriso socat curl wget openssl python3 python3-pip git edk2-ovmf iproute procps-ng ca-certificates) ;;
+    apk)     pk=(bash qemu-system-x86_64 qemu-img cdrkit socat curl wget openssl python3 py3-pip git ovmf procps iproute2 ca-certificates) ;;
+    pacman)  pk=(qemu-system-x86 qemu-img cdrtools socat curl wget openssl python python-pip git edk2-ovmf procps-ng iproute2 ca-certificates) ;;
+  esac
+  for p in "${pk[@]}"; do pkg_install "$p" >/dev/null 2>&1 || warn "Bỏ qua gói: $p"; done
+
+  command -v websockify >/dev/null 2>&1 || {
+    info "Cài websockify qua pip..."
+    pip3 install websockify >/dev/null 2>&1 || pip3 install --break-system-packages websockify >/dev/null 2>&1 \
+      || $SUDO pip3 install --break-system-packages websockify >/dev/null 2>&1
+  }
+  find_novnc
+  [ -z "$NOVNC_DIR" ] && { info "Tải noVNC từ GitHub..."; $SUDO git clone --depth 1 https://github.com/novnc/noVNC /opt/novnc >/dev/null 2>&1; find_novnc; }
+
+  command -v cloudflared >/dev/null 2>&1 || {
+    info "Tải cloudflared..."
+    local a=amd64; case $(uname -m) in aarch64|arm64) a=arm64;; esac
+    $SUDO curl -fsSL -o /usr/local/bin/cloudflared "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$a" \
+      && $SUDO chmod +x /usr/local/bin/cloudflared || warn "Không tải được cloudflared (GUI qua tunnel sẽ không dùng được)."
+  }
+  if [ -n "$SCRIPT_URL" ] && [ ! -x /usr/local/bin/quahnah ]; then
+    $SUDO curl -fsSL "$SCRIPT_URL" -o /usr/local/bin/quahnah && $SUDO chmod +x /usr/local/bin/quahnah && info "Đã cài lệnh: quahnah"
+  fi
+  touch "$DEPS_MARK"
+  ok "Hoàn tất cài đặt phụ thuộc."
+}
+
+bootstrap(){
+  mkdir -p "$BASE_DIR" "$CACHE_DIR" "$RUN_DIR"
+  [ -f "$WIN_CONF" ] || cat > "$WIN_CONF" <<'EOF'
+# Link ISO Windows (http/https) hoặc đường dẫn file ISO trên máy. Để trống = script sẽ hỏi lúc tạo VM.
+# Lưu ý: link fwlink của Microsoft Evaluation Center có thể đổi theo thời gian - hãy kiểm tra lại.
+WIN10_URL=""
+WIN11_URL=""
+WINLTSC_URL="https://go.microsoft.com/fwlink/p/?LinkID=2195404&clcid=0x409&culture=en-us&country=US"
+WINTINY_URL=""
+WINSERVER_URL="https://go.microsoft.com/fwlink/p/?LinkID=2195280&clcid=0x409&culture=en-us&country=US"
+EOF
+  find_qemu; find_novnc
+  if [ ! -f "$DEPS_MARK" ] || [ -z "$QEMU" ]; then install_deps; find_qemu; find_novnc; fi
+  [ -z "$QEMU" ] && { err "Không tìm thấy qemu-system-x86_64. Cài thủ công rồi chạy lại."; exit 1; }
+}
+
+# ---------- danh sách OS ----------
+OSN=("CentOS Stream 9" "Ubuntu 24.04" "AlmaLinux 9" "Ubuntu 22.04" "Rocky Linux 9" "Fedora 40" "Debian 11" "Debian 13" "Debian 12" "Windows 10" "Windows 11" "Windows LTSC" "Windows Tiny (Tiny10/Tiny11)" "Windows Server")
+OSF=(rhel deb rhel deb rhel fed deb deb deb win win win win win)
+OSU=(
+"https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2"
+"https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+"https://repo.almalinux.org/almalinux/9/cloud/x86_64/images/AlmaLinux-9-GenericCloud-latest.x86_64.qcow2"
+"https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
+"https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2"
+"https://dl.fedoraproject.org/pub/archive/fedora/linux/releases/40/Cloud/x86_64/images/Fedora-Cloud-Base-Generic.x86_64-40-1.14.qcow2"
+"https://cloud.debian.org/images/cloud/bullseye/latest/debian-11-generic-amd64.qcow2"
+"https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-amd64.qcow2"
+"https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2"
+WIN10_URL WIN11_URL WINLTSC_URL WINTINY_URL WINSERVER_URL )
+
+dl(){ # dl URL OUT
+  local tmp="$2.tmp"
+  if command -v wget >/dev/null; then wget -q --show-progress -O "$tmp" "$1"; else curl -L --progress-bar -o "$tmp" "$1"; fi \
+    && [ -s "$tmp" ] && mv "$tmp" "$2" || { rm -f "$tmp"; return 1; }
+}
+
+# ---------- config VM ----------
+CONF_KEYS=(VM_NAME VM_OS VM_FAM VM_HOST VM_USER VM_PASS VM_DISK VM_MEM VM_CPUS VM_PORT VM_GUI VM_FWD VM_ISO)
+save_conf(){ for k in "${CONF_KEYS[@]}"; do printf '%s=%q\n' "$k" "${!k}"; done > "$BASE_DIR/$VM_NAME.conf"; }
+load_conf(){ for k in "${CONF_KEYS[@]}"; do unset "$k"; done; . "$BASE_DIR/$1.conf"; }
+pidf(){ echo "$RUN_DIR/$1.$2.pid"; }   # pidf NAME qemu|ws|cf
+is_running(){ local p; p=$(cat "$(pidf "$1" qemu)" 2>/dev/null) && [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
+list_vms(){ VMS=(); for f in "$BASE_DIR"/*.conf; do [ -f "$f" ] && [ "$(basename "$f")" != "windows_urls.conf" ] && VMS+=("$(basename "$f" .conf)"); done; }
+pick_vm(){
+  list_vms; [ ${#VMS[@]} -eq 0 ] && { warn "Chưa có VM nào."; return 1; }
+  local i=1; for v in "${VMS[@]}"; do echo "  $i) $v $(is_running "$v" && echo '🟢 running' || echo '⚪ stopped')"; i=$((i+1)); done
+  ask SEL "Chọn VM" 1
+  [[ $SEL =~ ^[0-9]+$ ]] && [ "$SEL" -ge 1 ] && [ "$SEL" -le ${#VMS[@]} ] || { err "Lựa chọn không hợp lệ"; return 1; }
+  SEL_VM=${VMS[$((SEL-1))]}; load_conf "$SEL_VM"
+}
+free_port(){ local p=$1; while ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]$p\$"; do p=$((p+1)); done; echo "$p"; }
+rand8(){ tr -dc 'A-Za-z0-9' </dev/urandom | head -c 8; }
+
+# ---------- cloud-init ----------
+mkseed(){ # mkseed DIR OUT
+  if command -v cloud-localds >/dev/null; then cloud-localds "$2" "$1/user-data" "$1/meta-data"
+  elif command -v genisoimage >/dev/null; then genisoimage -quiet -output "$2" -volid cidata -joliet -rock "$1/user-data" "$1/meta-data"
+  elif command -v xorriso >/dev/null; then xorriso -as mkisofs -quiet -o "$2" -V cidata -J -r "$1/user-data" "$1/meta-data"
+  elif command -v mkisofs >/dev/null; then mkisofs -quiet -o "$2" -V cidata -J -r "$1/user-data" "$1/meta-data"
+  else err "Thiếu genisoimage/xorriso để tạo cloud-init seed"; return 1; fi
+}
+gui_cmds(){
+  case $VM_FAM in
+    deb)  echo " - DEBIAN_FRONTEND=noninteractive apt-get update
+ - DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 xfce4-terminal lightdm dbus-x11" ;;
+    rhel) echo ' - dnf -y groupinstall "Server with GUI"' ;;
+    fed)  echo ' - dnf -y groupinstall "Xfce Desktop"
+ - dnf -y install lightdm' ;;
+  esac
+  echo " - systemctl set-default graphical.target
+ - reboot"
+}
+make_linux_seed(){
+  local d; d=$(mktemp -d)
+  cat > "$d/meta-data" <<EOF
+instance-id: $VM_NAME-$(date +%s)
+local-hostname: $VM_HOST
+EOF
+  {
+    cat <<EOF
+#cloud-config
+hostname: $VM_HOST
+manage_etc_hosts: true
+ssh_pwauth: true
+disable_root: false
+users:
+  - default
+EOF
+    [ "$VM_USER" != root ] && printf '  - name: %s\n    sudo: ALL=(ALL) NOPASSWD:ALL\n    shell: /bin/bash\n    lock_passwd: false\n' "$VM_USER"
+    cat <<EOF
+chpasswd:
+  expire: false
+  list: |
+    root:$VM_PASS
+EOF
+    [ "$VM_USER" != root ] && echo "    $VM_USER:$VM_PASS"
+    cat <<'EOF'
+runcmd:
+ - rm -f /etc/ssh/sshd_config.d/60-cloudimg-settings.conf
+ - sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+ - sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+ - systemctl restart sshd || systemctl restart ssh
+EOF
+    [ "$VM_GUI" = y ] && gui_cmds
+  } > "$d/user-data"
+  mkseed "$d" "$BASE_DIR/$VM_NAME.seed.iso"; local rc=$?
+  rm -rf "$d"; return $rc
+}
+
+# ---------- tạo VM ----------
+create_vm(){
+  echo; info "🆕 Tạo VM mới"
+  ask VM_NAME "Enter VM name" "vm$(date +%H%M)"
+  [[ $VM_NAME =~ ^[A-Za-z0-9_-]+$ ]] || { err "Tên chỉ gồm chữ, số, - và _"; return; }
+  [ -f "$BASE_DIR/$VM_NAME.conf" ] && { err "VM '$VM_NAME' đã tồn tại"; return; }
+  ask VM_GUI "Enable GUI mode? (y/n)" n; VM_GUI=$(echo "$VM_GUI" | tr 'A-Z' 'a-z'); [ "$VM_GUI" != y ] && VM_GUI=n
+
+  echo; info "Chọn OS:"
+  local lim=9; [ "$VM_GUI" = y ] && lim=${#OSN[@]}
+  for ((i=0;i<lim;i++)); do echo "  $((i+1))) ${OSN[$i]}"; done
+  ask CH "Enter your choice (1-$lim)" ""
+  [[ $CH =~ ^[0-9]+$ ]] && [ "$CH" -ge 1 ] && [ "$CH" -le "$lim" ] || { err "Lựa chọn không hợp lệ"; return; }
+  local idx=$((CH-1)); VM_OS=${OSN[$idx]}; VM_FAM=${OSF[$idx]}
+
+  local dh=2048 dc=2 dd=20G dp=2222 du=debian
+  if [ "$VM_FAM" = win ]; then dh=4096; dc=4; dd=64G; dp=3389; du=Administrator; fi
+  ask VM_HOST "Enter hostname" "$VM_NAME"
+  if [ "$VM_FAM" != win ]; then
+    ask VM_USER "Enter username" "$du"; ask VM_PASS "Enter password" "$du"
+    [ "$VM_GUI" = y ] && [ "$VM_USER" = root ] && warn "GUI đăng nhập bằng root thường bị chặn, nên dùng user thường."
+  else VM_USER=-; VM_PASS=-; fi
+  ask VM_DISK "Disk size" "$dd"
+  ask VM_MEM  "Memory in MB" "$dh"
+  ask VM_CPUS "Number of CPUs" "$dc"
+  ask VM_PORT "$([ "$VM_FAM" = win ] && echo 'RDP' || echo 'SSH') Port" "$dp"
+  ask VM_FWD  "Additional port forwards (e.g., 8080:80,8443:443), Enter for none" ""
+
+  info "📥 Downloading and preparing image..."
+  local img="$BASE_DIR/$VM_NAME.img" src="${OSU[$idx]}"
+  if [ "$VM_FAM" = win ]; then
+    . "$WIN_CONF"; src=${!src}
+    [ -z "$src" ] && ask src "Dán link ISO hoặc đường dẫn file ISO của ${VM_OS}" ""
+    [ -z "$src" ] && { err "Chưa có ISO"; return; }
+    if [ -f "$src" ]; then VM_ISO=$src
+    else
+      VM_ISO="$CACHE_DIR/$(echo -n "$src" | cksum | cut -d' ' -f1)-win.iso"
+      [ -s "$VM_ISO" ] || dl "$src" "$VM_ISO" || { err "Tải ISO thất bại"; return; }
+    fi
+    qemu-img create -f qcow2 "$img" "$VM_DISK" >/dev/null || { err "Tạo disk lỗi"; return; }
+  else
+    local cache="$CACHE_DIR/$(basename "$src")"
+    [ -s "$cache" ] || dl "$src" "$cache" || { err "Tải image thất bại"; return; }
+    cp "$cache" "$img" && qemu-img resize "$img" "$VM_DISK" >/dev/null && info "Image resized."
+    make_linux_seed || return
+    VM_ISO=""
+  fi
+  save_conf
+  ok "VM '$VM_NAME' created successfully."
+  if [ "$VM_FAM" = win ]; then
+    info "Windows: Start VM → mở link noVNC → cài đặt. Đã gắn sẵn ISO ở ổ CD (ổ đĩa SATA, không cần driver)."
+    info "Cài xong vào 'Edit VM configuration' → gỡ ISO. RDP forward: localhost:$VM_PORT"
+  else
+    info "Login with: username=$VM_USER, password=$VM_PASS"
+    info "SSH: ssh -p $VM_PORT $VM_USER@localhost"
+    [ "$VM_GUI" = y ] && info "GUI: lần boot đầu sẽ tự cài XFCE rồi reboot (vài phút, có KVM sẽ nhanh hơn)."
+  fi
+  ok "Configuration saved to $BASE_DIR/$VM_NAME.conf"
+}
+
+# ---------- start / stop ----------
+build_fwd(){
+  local f="hostfwd=tcp::$VM_PORT-:$([ "$VM_FAM" = win ] && echo 3389 || echo 22)"
+  IFS=',' read -ra P <<< "$VM_FWD"
+  for x in "${P[@]}"; do [[ $x =~ ^[0-9]+:[0-9]+$ ]] && f+=",hostfwd=tcp::${x%%:*}-:${x##*:}"; done
+  echo "$f"
+}
+find_ovmf(){ for f in /usr/share/ovmf/OVMF.fd /usr/share/qemu/OVMF.fd /usr/share/OVMF/OVMF.fd; do [ -f "$f" ] && { echo "$f"; return; }; done; }
+
+start_vm(){
+  pick_vm || return; local n=$VM_NAME
+  is_running "$n" && { warn "VM đang chạy rồi."; return; }
+  local img="$BASE_DIR/$n.img" cpus=$VM_CPUS A=()
+  A=(-name "$n" -m "$VM_MEM" -pidfile "$(pidf "$n" qemu)" -rtc base=utc,clock=host -device virtio-rng-pci)
+
+  # --- chọn accel: KVM hoặc TCG tối ưu ---
+  local cache=writeback
+  if kvm_ok; then
+    ok "KVM khả dụng → dùng KVM."
+    local cpu=host; [ "$VM_FAM" = win ] && cpu="host,hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time"
+    A+=(-machine q35 -accel kvm -cpu "$cpu")
+  else
+    warn "Không có KVM → chạy TCG và bật tối ưu (multi-thread TCG, cache lớn, I/O unsafe, giới hạn vCPU)."
+    local hc; hc=$(nproc 2>/dev/null || echo 2); [ "$cpus" -gt "$hc" ] && cpus=$hc
+    cache=unsafe
+    A+=(-machine q35 -accel tcg,thread=multi,tb-size=512 -cpu max -no-hpet)
+    [ "$VM_FAM" = win ] && warn "Windows không có KVM sẽ RẤT chậm."
+  fi
+  A+=(-smp "$cpus")
+
+  # --- disk + net ---
+  local net="user,id=n0,$(build_fwd)"
+  if [ "$VM_FAM" = win ]; then
+    A+=(-drive "file=$img,if=none,id=d0,format=qcow2,cache=$cache" -device ahci,id=ahci -device ide-hd,drive=d0,bus=ahci.0
+        -netdev "$net" -device e1000,netdev=n0 -rtc base=localtime -usb -device usb-tablet)
+    if [ -n "$VM_ISO" ] && [ -f "$VM_ISO" ]; then A+=(-cdrom "$VM_ISO" -boot order=dc); fi
+    case $VM_OS in "Windows 11"|Windows\ Tiny*) local bios; bios=$(find_ovmf); [ -n "$bios" ] && A+=(-bios "$bios") || warn "Không thấy OVMF.fd, boot BIOS thường." ;; esac
+  else
+    A+=(-drive "file=$img,if=virtio,format=qcow2,cache=$cache,aio=threads,discard=unmap"
+        -drive "file=$BASE_DIR/$n.seed.iso,if=virtio,format=raw,readonly=on"
+        -netdev "$net" -device virtio-net-pci,netdev=n0)
+  fi
+
+  if [ "$VM_GUI" != y ]; then
+    info "🖥️  Chạy trực tiếp trên terminal này. Thoát VM: Ctrl+A rồi X  |  SSH: ssh -p $VM_PORT $VM_USER@localhost"
+    trap 'rm -f "$(pidf "$n" qemu)"' RETURN
+    "$QEMU" "${A[@]}" -nographic
+    return
+  fi
+
+  # --- GUI: VNC + websockify/noVNC + cloudflared ---
+  local vp wp vpass sock="$RUN_DIR/$n.mon"
+  vp=$(free_port 5901); wp=$(free_port 6080); vpass=$(rand8)
+  rm -f "$sock"
+  A+=(-vga std -usb -device usb-tablet -display none -vnc "127.0.0.1:$((vp-5900)),password=on"
+      -monitor "unix:$sock,server,nowait" -daemonize)
+  "$QEMU" "${A[@]}" || { err "QEMU khởi động thất bại"; return; }
+  for _ in 1 2 3 4 5; do [ -S "$sock" ] && break; sleep 1; done
+  printf 'set_password vnc %s\n' "$vpass" | socat - "UNIX-CONNECT:$sock" >/dev/null 2>&1 || warn "Không đặt được mật khẩu VNC!"
+  echo "$vpass" > "$RUN_DIR/$n.vncpass"
+
+  find_novnc
+  nohup websockify --web "$NOVNC_DIR" "$wp" "127.0.0.1:$vp" >"$RUN_DIR/$n.ws.log" 2>&1 & echo $! > "$(pidf "$n" ws)"
+  rm -f "$RUN_DIR/$n.url"
+  if command -v cloudflared >/dev/null; then
+    nohup cloudflared tunnel --no-autoupdate --url "http://127.0.0.1:$wp" >"$RUN_DIR/$n.cf.log" 2>&1 & echo $! > "$(pidf "$n" cf)"
+    info "⏳ Đang tạo Cloudflare tunnel..."
+    for _ in $(seq 1 30); do
+      u=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' "$RUN_DIR/$n.cf.log" 2>/dev/null | head -1)
+      [ -n "$u" ] && { echo "$u" > "$RUN_DIR/$n.url"; break; }; sleep 1
+    done
+  fi
+  ok "VM '$n' đang chạy (nền)."
+  show_access "$n" "$wp"
+}
+show_access(){
+  local n=$1 wp=$2 u; u=$(cat "$RUN_DIR/$n.url" 2>/dev/null)
+  echo
+  [ -n "$u" ] && echo -e "  🌐 noVNC (Cloudflare): ${G}$u/vnc.html?autoconnect=true&resize=scale${N}"
+  [ -n "$wp" ] && echo -e "  🏠 noVNC (local):      http://127.0.0.1:$wp/vnc.html"
+  echo -e "  🔑 Mật khẩu VNC:       ${Y}$(cat "$RUN_DIR/$n.vncpass" 2>/dev/null)${N}"
+  echo
+}
+kill_pid(){ local p; p=$(cat "$1" 2>/dev/null); [ -n "$p" ] && kill "$p" 2>/dev/null; rm -f "$1"; }
+stop_vm(){
+  pick_vm || return; local n=$VM_NAME
+  local p; p=$(cat "$(pidf "$n" qemu)" 2>/dev/null)
+  if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+    kill "$p"; for _ in $(seq 1 10); do kill -0 "$p" 2>/dev/null || break; sleep 1; done
+    kill -0 "$p" 2>/dev/null && kill -9 "$p"
+  fi
+  rm -f "$(pidf "$n" qemu)" "$RUN_DIR/$n.url"; kill_pid "$(pidf "$n" ws)"; kill_pid "$(pidf "$n" cf)"
+  ok "Đã dừng VM '$n'."
+}
+
+# ---------- các chức năng khác ----------
+show_info(){
+  pick_vm || return; local n=$VM_NAME
+  echo; echo "  Tên:      $n"; echo "  OS:       $VM_OS"; echo "  Hostname: $VM_HOST"
+  [ "$VM_FAM" != win ] && echo "  Login:    $VM_USER / $VM_PASS"
+  echo "  Disk:     $VM_DISK (dùng thực: $(du -h "$BASE_DIR/$n.img" 2>/dev/null | cut -f1))"
+  echo "  RAM/CPU:  ${VM_MEM}MB / $VM_CPUS"; echo "  Port:     $VM_PORT  (fwd thêm: ${VM_FWD:-none})"
+  echo "  GUI:      $VM_GUI"; [ -n "$VM_ISO" ] && echo "  ISO:      $VM_ISO"
+  if is_running "$n"; then echo "  Trạng thái: 🟢 running"; [ "$VM_GUI" = y ] && show_access "$n" ""; else echo "  Trạng thái: ⚪ stopped"; fi
+  [ "$VM_FAM" != win ] && echo "  SSH:      ssh -p $VM_PORT $VM_USER@localhost"
+}
+edit_vm(){
+  pick_vm || return; is_running "$VM_NAME" && { err "Hãy dừng VM trước khi sửa."; return; }
+  local old=$VM_NAME
+  ask VM_MEM "Memory MB" "$VM_MEM"; ask VM_CPUS "CPUs" "$VM_CPUS"; ask VM_PORT "Port" "$VM_PORT"
+  ask VM_FWD "Port forwards" "$VM_FWD"
+  ask VM_GUI "GUI (y/n)" "$VM_GUI"
+  if [ -n "$VM_ISO" ]; then ask D "Gỡ ISO cài đặt? (y/n)" n; [ "$D" = y ] && VM_ISO=""; fi
+  VM_NAME=$old; save_conf; ok "Đã lưu. (User/password chỉ áp dụng lúc tạo VM.)"
+}
+delete_vm(){
+  pick_vm || return; local n=$VM_NAME
+  ask Y "Xóa VM '$n' vĩnh viễn? (y/n)" n; [ "$Y" = y ] || return
+  is_running "$n" && { VM_NAME=$n; SEL=1; }
+  for k in qemu ws cf; do kill_pid "$(pidf "$n" $k)"; done
+  rm -f "$BASE_DIR/$n".{conf,img,seed.iso} "$RUN_DIR/$n".*; ok "Đã xóa '$n'."
+}
+resize_vm(){
+  pick_vm || return; is_running "$VM_NAME" && { err "Dừng VM trước."; return; }
+  ask NEWS "Kích thước mới (vd 40G, chỉ tăng)" "$VM_DISK"
+  qemu-img resize "$BASE_DIR/$VM_NAME.img" "$NEWS" && { VM_DISK=$NEWS; save_conf; ok "Đã resize. Linux tự mở rộng phân vùng khi boot (cloud-init)."; }
+}
+perf_vm(){
+  echo; info "Host: $(nproc) CPU | load: $(cut -d' ' -f1-3 /proc/loadavg) | $(free -m | awk '/Mem:/{print $3"/"$2" MB RAM"}')"
+  kvm_ok && info "KVM: BẬT" || warn "KVM: TẮT (TCG)"
+  list_vms
+  for v in "${VMS[@]}"; do
+    if is_running "$v"; then p=$(cat "$(pidf "$v" qemu)"); echo "  🟢 $v  $(ps -p "$p" -o %cpu=,%mem=,rss= | awk '{printf "CPU %s%% | MEM %s%% | RSS %d MB",$1,$2,$3/1024}')"
+    else echo "  ⚪ $v (stopped)"; fi
+  done
+}
+fix_vm(){
+  info "🔧 Kiểm tra & sửa lỗi..."
+  for f in "$RUN_DIR"/*.qemu.pid; do [ -f "$f" ] || continue
+    p=$(cat "$f"); kill -0 "$p" 2>/dev/null || { rm -f "$f"; warn "Xóa pid cũ: $(basename "$f")"; }
+  done
+  [ -e /dev/kvm ] && [ ! -w /dev/kvm ] && { $SUDO chmod 666 /dev/kvm 2>/dev/null && ok "Đã cấp quyền /dev/kvm"; }
+  list_vms
+  for v in "${VMS[@]}"; do
+    is_running "$v" || { qemu-img check "$BASE_DIR/$v.img" >/dev/null 2>&1 && ok "$v: disk OK" || err "$v: disk có lỗi (qemu-img check $BASE_DIR/$v.img)"; }
+  done
+  command -v websockify >/dev/null || warn "Thiếu websockify"; command -v cloudflared >/dev/null || warn "Thiếu cloudflared"
+  ask R "Cài lại phụ thuộc? (y/n)" n; [ "$R" = y ] && { install_deps; }
+}
+
+# ---------- main ----------
+main_menu(){
+  while true; do
+    banner
+    list_vms
+    if [ ${#VMS[@]} -gt 0 ]; then
+      info "📂 Found ${#VMS[@]} existing VM(s):"
+      i=1; for v in "${VMS[@]}"; do echo "  $i) $v $(is_running "$v" && echo 🟢)"; i=$((i+1)); done; echo
+      cat <<'EOF'
+Main Menu:
+  1) 🆕 Create a new VM
+  2) ▶️  Start a VM
+  3) ⏹️  Stop a VM
+  4) 📋 Show VM info
+  5) ✏️  Edit VM configuration
+  6) 🗑️  Delete a VM
+  7) 📏 Resize VM disk
+  8) 📊 Show VM performance
+  9) 🔧 Fix VM issues
+  0) 🚪 Exit
+EOF
+    else
+      printf 'Main Menu:\n  1) 🆕 Create a new VM\n  0) 🚪 Exit\n'
+    fi
+    echo; ask C "Enter your choice" ""
+    case $C in
+      1) create_vm ;; 2) start_vm ;; 3) stop_vm ;; 4) show_info ;; 5) edit_vm ;;
+      6) delete_vm ;; 7) resize_vm ;; 8) perf_vm ;; 9) fix_vm ;;
+      0) echo "Bye!"; exit 0 ;; *) warn "Lựa chọn không hợp lệ" ;;
+    esac
+    echo; pause
+  done
+}
+
+bootstrap
+main_menu
