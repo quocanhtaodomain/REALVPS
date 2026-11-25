@@ -184,7 +184,12 @@ CONF_KEYS=(VM_NAME VM_OS VM_FAM VM_HOST VM_USER VM_PASS VM_DISK VM_MEM VM_CPUS V
 save_conf(){ for k in "${CONF_KEYS[@]}"; do printf '%s=%q\n' "$k" "${!k}"; done > "$BASE_DIR/$VM_NAME.conf"; }
 load_conf(){ for k in "${CONF_KEYS[@]}"; do unset "$k"; done; . "$BASE_DIR/$1.conf"; }
 pidf(){ echo "$RUN_DIR/$1.$2.pid"; }   # pidf NAME qemu|ws|cf
-is_running(){ local p; p=$(cat "$(pidf "$1" qemu)" 2>/dev/null) && [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
+qpid(){  # PID của QEMU thuộc VM $1 (ưu tiên pidfile, nếu không có thì dò theo -name)
+  local p; p=$(cat "$(pidf "$1" qemu)" 2>/dev/null)
+  if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then echo "$p"; return; fi
+  pgrep -f "qemu.* -name $1( |,)" 2>/dev/null | head -1
+}
+is_running(){ [ -n "$(qpid "$1")" ]; }
 list_vms(){ VMS=(); for f in "$BASE_DIR"/*.conf; do [ -f "$f" ] && [ "$(basename "$f")" != "windows_urls.conf" ] && VMS+=("$(basename "$f" .conf)"); done; }
 pick_vm(){
   list_vms; [ ${#VMS[@]} -eq 0 ] && { warn "Chưa có VM nào."; return 1; }
@@ -338,7 +343,15 @@ find_ovmf(){ for f in /usr/share/ovmf/OVMF.fd /usr/share/qemu/OVMF.fd /usr/share
 
 start_vm(){
   pick_vm || return; local n=$VM_NAME
-  is_running "$n" && { warn "VM đang chạy rồi."; return; }
+  local q; q=$(qpid "$n")
+  if [ -n "$q" ]; then
+    warn "VM '$n' đang chạy sẵn (PID $q) - có thể từ tab/terminal khác."
+    ask K "Tắt tiến trình đó rồi chạy lại? (y/n)" y
+    [ "$K" = y ] || return
+    kill "$q" 2>/dev/null; sleep 2; kill -9 "$q" 2>/dev/null; rm -f "$(pidf "$n" qemu)"
+  fi
+  local np; np=$(free_port "$VM_PORT")
+  if [ "$np" != "$VM_PORT" ]; then warn "Cổng $VM_PORT đang bị chiếm → dùng cổng $np"; VM_PORT=$np; save_conf; fi
   local img="$BASE_DIR/$n.img" cpus=$VM_CPUS A=()
   A=(-name "$n" -m "$VM_MEM" -pidfile "$(pidf "$n" qemu)" -rtc base=utc,clock=host -device virtio-rng-pci)
 
@@ -352,7 +365,7 @@ start_vm(){
     warn "Không có KVM → chạy TCG và bật tối ưu (multi-thread TCG, cache lớn, I/O unsafe, giới hạn vCPU)."
     local hc; hc=$(nproc 2>/dev/null || echo 2); [ "$cpus" -gt "$hc" ] && cpus=$hc
     cache=unsafe
-    A+=(-machine q35 -accel tcg,thread=multi,tb-size=512 -cpu max -no-hpet)
+    A+=(-machine q35 -accel tcg,thread=multi,tb-size=512 -cpu max)
     [ "$VM_FAM" = win ] && warn "Windows không có KVM sẽ RẤT chậm."
   fi
   A+=(-smp "$cpus")
@@ -421,8 +434,8 @@ show_access(){
 kill_pid(){ local p; p=$(cat "$1" 2>/dev/null); [ -n "$p" ] && kill "$p" 2>/dev/null; rm -f "$1"; }
 stop_vm(){
   pick_vm || return; local n=$VM_NAME
-  local p; p=$(cat "$(pidf "$n" qemu)" 2>/dev/null)
-  if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+  local p; p=$(qpid "$n")
+  if [ -n "$p" ]; then
     kill "$p"; for _ in $(seq 1 10); do kill -0 "$p" 2>/dev/null || break; sleep 1; done
     kill -0 "$p" 2>/dev/null && kill -9 "$p"
   fi
