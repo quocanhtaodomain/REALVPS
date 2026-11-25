@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ============================================================================
 #  Quahnah VPS Create - tạo & quản lý VM bằng QEMU (có KVM thì dùng, không có thì TCG tối ưu)
-#  Chạy:  bash <(curl -fsSL https://raw.githubusercontent.com/quocanhtaodomain/REALVPS/refs/heads/main/quahnahvps)
+#  Chạy:  bash <(curl -fsSL https://RAW_URL/quahnah-vps.sh)
 # ============================================================================
 
-SCRIPT_URL="https://raw.githubusercontent.com/quocanhtaodomain/REALVPS/refs/heads/main/quahnahvps"   # <-- điền raw URL của file này để lần đầu tự cài lệnh `quahnah` (có thể để trống)
+SCRIPT_URL=""   # <-- điền raw URL của file này để lần đầu tự cài lệnh `quahnah` (có thể để trống)
 BASE_DIR="${QVPS_HOME:-$HOME/vms}"
 CACHE_DIR="$BASE_DIR/.cache"
 RUN_DIR="$BASE_DIR/.run"
@@ -77,10 +77,10 @@ install_deps(){
   local pk=()
   case $PM in
     apt-get) $SUDO apt-get update -y >/dev/null 2>&1
-      pk=(qemu-system-x86 qemu-utils genisoimage socat curl wget openssl python3 python3-pip websockify novnc ovmf procps iproute2 ca-certificates git) ;;
-    dnf|yum) pk=(qemu-kvm qemu-img genisoimage xorriso socat curl wget openssl python3 python3-pip git edk2-ovmf iproute procps-ng ca-certificates) ;;
-    apk)     pk=(bash qemu-system-x86_64 qemu-img cdrkit socat curl wget openssl python3 py3-pip git ovmf procps iproute2 ca-certificates) ;;
-    pacman)  pk=(qemu-system-x86 qemu-img cdrtools socat curl wget openssl python python-pip git edk2-ovmf procps-ng iproute2 ca-certificates) ;;
+      pk=(qemu-system-x86 qemu-utils libaio1 libaio1t64 libaio-dev genisoimage socat curl wget openssl python3 python3-pip websockify novnc ovmf procps iproute2 ca-certificates git) ;;
+    dnf|yum) pk=(qemu-kvm qemu-img libaio genisoimage xorriso socat curl wget openssl python3 python3-pip git edk2-ovmf iproute procps-ng ca-certificates) ;;
+    apk)     pk=(bash qemu-system-x86_64 qemu-img libaio cdrkit socat curl wget openssl python3 py3-pip git ovmf procps iproute2 ca-certificates) ;;
+    pacman)  pk=(qemu-system-x86 qemu-img libaio cdrtools socat curl wget openssl python python-pip git edk2-ovmf procps-ng iproute2 ca-certificates) ;;
   esac
   for p in "${pk[@]}"; do pkg_install "$p" >/dev/null 2>&1 || warn "Bỏ qua gói: $p"; done
 
@@ -119,6 +119,19 @@ EOF
   find_qemu; find_novnc
   if [ ! -f "$DEPS_MARK" ] || [ -z "$QEMU" ]; then install_deps; find_qemu; find_novnc; fi
   [ -z "$QEMU" ] && { err "Không tìm thấy qemu-system-x86_64. Cài thủ công rồi chạy lại."; exit 1; }
+  check_qemu
+}
+check_qemu(){
+  local out; out=$("$QEMU" --version 2>&1) && return 0
+  err "QEMU ($QEMU) không chạy được: $(echo "$out" | head -1)"
+  if echo "$out" | grep -q 'shared librar'; then
+    warn "Thiếu thư viện → thử cài libaio..."
+    detect_pm; for p in libaio1 libaio1t64 libaio; do pkg_install "$p" >/dev/null 2>&1; done
+    "$QEMU" --version >/dev/null 2>&1 && { ok "Đã sửa lỗi thư viện."; return 0; }
+    err "Vẫn lỗi. Chạy: ldd $QEMU | grep 'not found'  rồi cài các thư viện còn thiếu (cần root/sudo)."
+    [ -z "$SUDO" ] && [ "$(id -u)" -ne 0 ] && warn "Bạn không phải root và không có sudo nên không tự cài được."
+    exit 1
+  fi
 }
 
 # ---------- danh sách OS ----------
@@ -224,11 +237,14 @@ create_vm(){
   ask VM_GUI "Enable GUI mode? (y/n)" n; VM_GUI=$(echo "$VM_GUI" | tr 'A-Z' 'a-z'); [ "$VM_GUI" != y ] && VM_GUI=n
 
   echo; info "Chọn OS:"
-  local lim=9; [ "$VM_GUI" = y ] && lim=${#OSN[@]}
-  for ((i=0;i<lim;i++)); do echo "  $((i+1))) ${OSN[$i]}"; done
+  local lim=${#OSN[@]}
+  for ((i=0;i<lim;i++)); do
+    if [ "${OSF[$i]}" = win ]; then echo "  $((i+1))) ${OSN[$i]}  (cần GUI - tự bật)"; else echo "  $((i+1))) ${OSN[$i]}"; fi
+  done
   ask CH "Enter your choice (1-$lim)" ""
   [[ $CH =~ ^[0-9]+$ ]] && [ "$CH" -ge 1 ] && [ "$CH" -le "$lim" ] || { err "Lựa chọn không hợp lệ"; return; }
   local idx=$((CH-1)); VM_OS=${OSN[$idx]}; VM_FAM=${OSF[$idx]}
+  [ "$VM_FAM" = win ] && [ "$VM_GUI" != y ] && { VM_GUI=y; info "Windows bắt buộc dùng GUI → đã tự bật GUI (noVNC + Cloudflare)."; }
 
   local dh=2048 dc=2 dd=20G dp=2222 du=debian
   if [ "$VM_FAM" = win ]; then dh=4096; dc=4; dd=64G; dp=3389; du=Administrator; fi
