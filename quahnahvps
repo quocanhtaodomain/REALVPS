@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ============================================================================
 #  Quahnah VPS Create - tạo & quản lý VM bằng QEMU (có KVM thì dùng, không có thì TCG tối ưu)
-#  Chạy:  bash <(curl -fsSL https://RAW_URL/quahnah-vps.sh)
+#  Chạy:  bash <(curl -fsSL https://raw.githubusercontent.com/quocanhtaodomain/REALVPS/refs/heads/main/quahnahvps)
 # ============================================================================
 
-SCRIPT_URL=""   # <-- điền raw URL của file này để lần đầu tự cài lệnh `quahnah` (có thể để trống)
+SCRIPT_URL="https://raw.githubusercontent.com/quocanhtaodomain/REALVPS/refs/heads/main/quahnahvps"   # <-- điền raw URL của file này để lần đầu tự cài lệnh `quahnah` (có thể để trống)
 BASE_DIR="${QVPS_HOME:-$HOME/vms}"
 CACHE_DIR="$BASE_DIR/.cache"
 RUN_DIR="$BASE_DIR/.run"
