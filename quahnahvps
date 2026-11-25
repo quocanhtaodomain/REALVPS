@@ -365,7 +365,11 @@ start_vm(){
     warn "Không có KVM → chạy TCG và bật tối ưu (multi-thread TCG, cache lớn, I/O unsafe, giới hạn vCPU)."
     local hc; hc=$(nproc 2>/dev/null || echo 2); [ "$cpus" -gt "$hc" ] && cpus=$hc
     cache=unsafe
-    A+=(-machine q35 -accel tcg,thread=multi,tb-size=512 -cpu max)
+    # đặt tên CPU của VM = tên CPU thật của máy chủ (chỉ đổi tên hiển thị)
+    local hn cpuopt=max
+    hn=$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ *//; s/,/,,/g')
+    [ -n "$hn" ] && cpuopt="max,model-id=$hn"
+    A+=(-machine q35 -accel tcg,thread=multi,tb-size=512 -cpu "$cpuopt")
     [ "$VM_FAM" = win ] && warn "Windows không có KVM sẽ RẤT chậm."
   fi
   A+=(-smp "$cpus")
